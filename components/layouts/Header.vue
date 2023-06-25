@@ -29,8 +29,25 @@
 
       <div class="d-flex">
         <div>
-          <button class="btn-network">
-            <div class="d-none d-sm-block nav-text">{{ netWorkName }}</div>
+          <button v-if="networkId" class="btn-network">
+            <b-dropdown :value="networkId">
+              <template #button-content>
+                {{ netWorkName }}
+              </template>
+              <b-dropdown-item
+                @click="onChainChange(item)"
+                v-for="item in networks"
+                :key="item"
+                :value="item"
+              >
+                {{ networkNameID[item] }}
+              </b-dropdown-item>
+            </b-dropdown>
+          </button>
+          <button v-else class="btn-network">
+            <div class="d-none d-sm-block nav-text">
+              {{ netWorkName }}
+            </div>
           </button>
         </div>
         <div class="text-decoration-none">
@@ -52,12 +69,12 @@
 </template>
 <script>
 import web3Plugin from "~/plugins/web3";
-
-import WalletConnect from "@walletconnect/client";
-import QRCodeModal from "@walletconnect/qrcode-modal";
-
-import { mapGetters, mapMutations } from "vuex";
-
+import providerManager from "~/plugins/web3-provider";
+import { networkNameID } from "~/store/web3.js";
+import { mapGetters, mapMutations, mapState } from "vuex";
+import { chainInfo } from "~/constants/chains.js";
+import { EthereumProvider } from "@walletconnect/ethereum-provider";
+import Web3 from "web3";
 const WC_MODE = {
   META_MASK: 1,
   WALLET_CONNECT: 2,
@@ -78,6 +95,9 @@ export default {
     },
     netWorkName() {
       return this.getNetName();
+    },
+    networkId() {
+      return this.getNetID();
     },
     homeUrl() {
       return `${this.$config.rootPageUrl}`;
@@ -102,12 +122,15 @@ export default {
       modalInfo: {
         modalTitle: "Please select a wallet connector",
       },
+      networkNameID,
+      networks: Object.keys(chainInfo).map((item) => Number(item)),
+      chainInfo,
     };
   },
   async mounted() {},
   methods: {
-    ...mapGetters("web3", ["getAccount", "getNetName"]),
-    ...mapMutations("web3", ["registerWeb3Instance"]),
+    ...mapGetters("web3", ["getAccount", "getNetName", "getNetID"]),
+    ...mapMutations("web3", ["registerWeb3Instance", "clearWeb3Instance"]),
     toogleModal(isVisible) {
       this.modalVisible = isVisible;
     },
@@ -125,50 +148,64 @@ export default {
         this.initMetamask();
       }
     },
-    async initWC() {
-      // Create a connector
-      const connector = new WalletConnect({
-        bridge: "https://bridge.walletconnect.org", // Required
-        qrcodeModal: QRCodeModal,
-      });
+    async initWC(chain = 1) {
+      let provider;
+      try {
+        provider = await EthereumProvider.init({
+          projectId: "5e711c3787dfac9c25953b0c0e272951",
+          chains: [chain],
+          rpcMap: {
+            [chain]: chainInfo[chain].rpcUrl,
+          },
+          showQrModal: true,
+        });
+        provider.on("connect", async (info) => {
+          try {
+            const instance = new Web3(provider);
+            const networkId = Number(info.chainId);
+            const accounts = await provider.request({
+              method: "eth_requestAccounts",
+            });
+            const balance = await instance.eth.getBalance(accounts[0]);
+            this.registerWeb3Instance({
+              networkId,
+              coinbase: accounts[0],
+              balance,
+            });
+            providerManager.setProvider(
+              provider,
+              this.accountorChainChangeCb.bind(this),
+              this.accountorChainChangeCb.bind(this),
+              this.disconnectCb.bind(this)
+            );
+          } catch (err) {
+            console.error("error in connect callback", err);
+          }
+        });
 
-      // Check if connection is already established
-      if (!connector.connected) {
-        // create new session
-        connector.createSession();
+        await provider.connect();
+      } catch (err) {
+        console.error("Error in wc", err);
+        this.clearWeb3Instance();
+        return;
       }
-
-      // Subscribe to connection events
-      connector.on("connect", (error, payload) => {
-        if (error) {
-          throw error;
-        }
-
-        // Get provided accounts and chainId
-        const { accounts, chainId } = payload.params[0];
-        // console.log("connect Accounts: ", accounts);
-        // console.log("connect chainId: ", chainId);
-      });
-
-      connector.on("session_update", (error, payload) => {
-        if (error) {
-          throw error;
-        }
-
-        // Get updated accounts and chainId
-        const { accounts, chainId } = payload.params[0];
-        // console.log("session_update Accounts: ", accounts);
-        // console.log("session_update chainId: ", chainId);
-      });
-
-      connector.on("disconnect", (error, payload) => {
-        // console.log("disconnect error: ", error);
-        // console.log("disconnect payload: ", payload);
-        if (error) {
-          throw error;
-        }
-
-        // Delete connector
+    },
+    async disconnectCb() {
+      const provider = providerManager.getProvider();
+      if (provider && provider.connected) {
+        await provider.disconnect();
+      }
+      this.clearWeb3Instance();
+    },
+    async accountorChainChangeCb() {
+      const instance = web3Plugin;
+      const networkId = await instance.eth.net.getId();
+      const coinbase = await instance.eth.getCoinbase();
+      const balance = await instance.eth.getBalance(coinbase);
+      this.registerWeb3Instance({
+        networkId,
+        coinbase,
+        balance,
       });
     },
     async initMetamask() {
@@ -194,7 +231,12 @@ export default {
             coinbase,
             balance,
           });
-
+          providerManager.setProvider(
+            window.ethereum,
+            this.accountorChainChangeCb.bind(this),
+            this.accountorChainChangeCb.bind(this),
+            this.disconnectCb.bind(this)
+          );
           // Back to home
           this.$router.push({
             path: "/",
@@ -210,6 +252,16 @@ export default {
         this.$toast.error("Please install Meta mask");
         console.error("No web3 provider detected");
         return;
+      }
+    },
+    async onChainChange(networkId) {
+      if (providerManager.getProvider().isMetaMask) {
+        await providerManager.switchChain({
+          ...chainInfo[networkId],
+          chain: networkId,
+        });
+      } else {
+        await this.initWC(Number(networkId));
       }
     },
   },
@@ -244,6 +296,22 @@ export default {
   margin-right: -24px;
   border-top-left-radius: 24px;
   border-bottom-left-radius: 24px;
+}
+
+::v-deep button.btn-network .btn.dropdown-toggle.btn-secondary {
+  background: transparent;
+  border: none;
+}
+::v-deep button.btn-network .dropdown-menu {
+  background: #2a2a2d;
+  border-radius: 24px;
+}
+::v-deep button.btn-network .dropdown-item {
+  color: white;
+  border-radius: 24px;
+}
+::v-deep button.btn-network .dropdown-item:hover {
+  color: #2a2a2d;
 }
 .btn-user {
   display: flex;
@@ -282,7 +350,7 @@ export default {
   margin-right: 24px;
 }
 .path-collapse {
-  flex:1;
+  flex: 1;
   display: flex;
   justify-content: flex-end;
   align-items: center;
